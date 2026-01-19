@@ -1,22 +1,26 @@
 package com.example.apiapp.ui
 
-import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableStateOf
-import androidx.compose.runtime.setValue
 import androidx.lifecycle.ViewModel
+import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.viewModelScope
 import com.example.apiapp.data.model.Character
 import com.example.apiapp.data.repository.RickAndMortyRepository
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 
-sealed interface ListUiState {
-    object Loading : ListUiState
-    data class Success(val characters: List<Character>) : ListUiState
-    data class Error(val message: String) : ListUiState
-    object Empty : ListUiState
-}
+data class ListScreenUiState(
+    val query: String = "",
+    val characters: List<Character> = emptyList(),
+    val isLoading: Boolean = false,
+    val error: String? = null,
+    val favourites: Set<Int> = emptySet(),
+    val isSearchResultEmpty: Boolean = false
+)
 
 sealed interface DetailUiState {
     object Loading : DetailUiState
@@ -24,73 +28,92 @@ sealed interface DetailUiState {
     data class Error(val message: String) : DetailUiState
 }
 
-class MainViewModel : ViewModel() {
-    private val repository = RickAndMortyRepository()
+class MainViewModel(private val repository: RickAndMortyRepository) : ViewModel() {
 
-    var listUiState: ListUiState by mutableStateOf(ListUiState.Loading)
-        private set
+    private val _uiState = MutableStateFlow(ListScreenUiState())
+    val uiState: StateFlow<ListScreenUiState> = _uiState.asStateFlow()
 
-    var detailUiState: DetailUiState by mutableStateOf(DetailUiState.Loading)
-        private set
-
-    var searchQuery by mutableStateOf("")
-        private set
-
-    var favorites by mutableStateOf(setOf<Character>())
-        private set
+    private val _detailUiState = MutableStateFlow<DetailUiState>(DetailUiState.Loading)
+    val detailUiState: StateFlow<DetailUiState> = _detailUiState.asStateFlow()
 
     private var searchJob: Job? = null
 
     init {
-        loadCharacters()
-    }
-
-    fun loadCharacters(query: String? = null) {
-        viewModelScope.launch {
-            listUiState = ListUiState.Loading
-            try {
-                val results = repository.getCharacters(query)
-                listUiState = if (results.isEmpty()) {
-                    ListUiState.Empty
-                } else {
-                    ListUiState.Success(results)
-                }
-            } catch (e: Exception) {
-                listUiState = ListUiState.Error(e.message ?: "Unknown error")
-            }
-        }
+        getCharactersInternal(null)
     }
 
     fun onSearchQueryChange(newQuery: String) {
-        searchQuery = newQuery
+        _uiState.update { it.copy(query = newQuery) }
         searchJob?.cancel()
         searchJob = viewModelScope.launch {
             delay(500)
-            loadCharacters(newQuery.ifBlank { null })
+            getCharactersInternal(newQuery.ifBlank { null })
+        }
+    }
+
+    fun retryListLoad() {
+        getCharactersInternal(_uiState.value.query.ifBlank { null })
+    }
+
+    private fun getCharactersInternal(query: String?) {
+        viewModelScope.launch {
+            _uiState.update { it.copy(isLoading = true, isSearchResultEmpty = false, error = null) }
+            repository.getCharacters(query)
+                .onSuccess { characters ->
+                    _uiState.update {
+                        it.copy(
+                            characters = characters,
+                            isLoading = false,
+                            isSearchResultEmpty = characters.isEmpty() && !query.isNullOrBlank()
+                        )
+                    }
+                }
+                .onFailure { throwable ->
+                    _uiState.update {
+                        it.copy(
+                            isLoading = false,
+                            error = throwable.message ?: "Unknown error"
+                        )
+                    }
+                }
         }
     }
 
     fun loadCharacterDetail(id: Int) {
         viewModelScope.launch {
-            detailUiState = DetailUiState.Loading
-            try {
-                val character = repository.getCharacter(id)
-                detailUiState = DetailUiState.Success(character)
-            } catch (e: Exception) {
-                detailUiState = DetailUiState.Error(e.message ?: "Unknown error")
+            _detailUiState.value = DetailUiState.Loading
+            repository.getCharacter(id)
+                .onSuccess { character ->
+                    _detailUiState.value = DetailUiState.Success(character)
+                }
+                .onFailure { throwable ->
+                    _detailUiState.value = DetailUiState.Error(throwable.message ?: "Unknown error")
+                }
+        }
+    }
+
+    fun toggleFavorite(characterId: Int) {
+        _uiState.update { currentState ->
+            val newFavorites = if (currentState.favourites.contains(characterId)) {
+                currentState.favourites - characterId
+            } else {
+                currentState.favourites + characterId
+            }
+            currentState.copy(favourites = newFavorites)
+        }
+    }
+
+    companion object {
+        fun provideFactory(
+            repository: RickAndMortyRepository
+        ): ViewModelProvider.Factory = object : ViewModelProvider.Factory {
+            @Suppress("UNCHECKED_CAST")
+            override fun <T : ViewModel> create(modelClass: Class<T>): T {
+                if (modelClass.isAssignableFrom(MainViewModel::class.java)) {
+                    return MainViewModel(repository) as T
+                }
+                throw IllegalArgumentException("Unknown ViewModel class")
             }
         }
-    }
-
-    fun toggleFavorite(character: Character) {
-        favorites = if (favorites.any { it.id == character.id }) {
-            favorites.filter { it.id != character.id }.toSet()
-        } else {
-            favorites + character
-        }
-    }
-
-    fun isFavorite(characterId: Int): Boolean {
-        return favorites.any { it.id == characterId }
     }
 }
